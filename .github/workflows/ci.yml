@@ -1,0 +1,114 @@
+name: CI
+
+# Verifies every push and pull request: creates the database schema, type-checks,
+# builds the production bundle, then boots the server and runs an end-to-end
+# smoke test of the live-sync API (report playback on a device, read it from another).
+#
+# Works with or without a committed package-lock.json. Committing the lock file is
+# still recommended: installs become reproducible and setup-node can cache npm.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Typecheck, build and smoke-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: app_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d app_db"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/app_db
+      NEXT_TELEMETRY_DISABLED: "1"
+      CI: "true"
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+
+      # `npm ci` and setup-node's npm cache both require a lock file. Detect it first
+      # so a repo without one still builds instead of failing on the install step.
+      - name: Detect lock file
+        id: lockfile
+        run: |
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=No npm lock file::Committing package-lock.json is recommended. Falling back to npm install."
+          fi
+
+      - name: Set up Node.js with npm cache
+        if: steps.lockfile.outputs.found == 'true'
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Node.js
+        if: steps.lockfile.outputs.found == 'false'
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Show toolchain versions
+        run: |
+          node --version
+          npm --version
+
+      - name: Create database tables
+        run: npx drizzle-kit push --force
+
+      - name: Generate route types
+        run: npx next typegen
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Build
+        run: npm run build
+
+      - name: Smoke-test live sync
+        run: |
+          npm run start -- --port 3000 > server.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+          BASE_URL=http://127.0.0.1:3000 node scripts/smoke-test.mjs
+        env:
+          BASE_URL: http://127.0.0.1:3000
+
+      - name: Show server log
+        if: failure()
+        run: cat server.log 2>/dev/null || echo "No server log was written."
